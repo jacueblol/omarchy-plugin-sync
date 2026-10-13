@@ -1,0 +1,58 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jacueblol.plugin-sync",
+  "name": "Plugin Sync",
+  "version": "1.0.0",
+  "author": "jacueblol",
+  "license": "MIT",
+  "homepage": "https://github.com/jacueblol/omarchy-plugin-sync",
+  "description": "Keep your Omarchy plugins and bar layout the same on every machine through a private git repo. Works alongside Omaplug.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Plugin Sync",
+    "description": "Sync plugins and bar layout between machines",
+    "category": "System",
+    "aliases": [
+      "sync",
+      "plugins",
+      "dotfiles"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "repo": "",
+      "autoSync": true,
+      "intervalMinutes": 15
+    },
+    "schema": [
+      {
+        "key": "repo",
+        "type": "string",
+        "label": "Sync repo",
+        "defaultValue": "",
+        "description": "owner/name on GitHub, or any git URL. Set up from the widget if empty."
+      },
+      {
+        "key": "autoSync",
+        "type": "boolean",
+        "label": "Sync automatically",
+        "defaultValue": true,
+        "description": "Push or pull on its own when only one machine changed. When both changed, it waits for you."
+      },
+      {
+        "key": "intervalMinutes",
+        "type": "integer",
+        "label": "Check every (minutes)",
+        "min": 5,
+        "max": 240,
+        "step": 5,
+        "defaultValue": 15
+      }
+    ]
+  }
+}
