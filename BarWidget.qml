@@ -58,6 +58,7 @@ BarWidget {
     function sync(): void { if (root.panelItem) root.panelItem.runAction("auto") }
     function push(): void { if (root.panelItem) root.panelItem.runAction("push") }
     function pull(): void { if (root.panelItem) root.panelItem.runAction("pull") }
+    function settings(): void { if (root.panelItem) { root.open(); root.panelItem.view = "settings" } }
     function open(): void { root.open() }
     function close(): void { root.close() }
     function show(): void { root.open() }

@@ -2,11 +2,11 @@
   "schemaVersion": 1,
   "id": "io.github.jacueblol.plugin-sync",
   "name": "Plugin Sync",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "jacueblol",
   "license": "MIT",
   "homepage": "https://github.com/jacueblol/omarchy-plugin-sync",
-  "description": "Keep your Omarchy plugins and bar layout the same on every machine through a private git repo. Works alongside Omaplug.",
+  "description": "Keep your Omarchy plugins and bar layout the same on every machine through a private git repo you own. Choose what syncs and when, per machine. Works alongside Omaplug.",
   "kinds": [
     "bar-widget"
   ],
@@ -26,8 +26,15 @@
     "defaultSection": "right",
     "defaults": {
       "repo": "",
-      "autoSync": true,
-      "intervalMinutes": 15
+      "mode": "Push automatically",
+      "onConflict": "Ask",
+      "syncPlugins": true,
+      "syncBar": true,
+      "syncShellSettings": false,
+      "removePlugins": true,
+      "localOnly": "",
+      "intervalMinutes": 15,
+      "notify": true
     },
     "schema": [
       {
@@ -35,14 +42,66 @@
         "type": "string",
         "label": "Sync repo",
         "defaultValue": "",
-        "description": "owner/name on GitHub, or any git URL. Set up from the widget if empty."
+        "description": "owner/name on GitHub, or any git URL you can push to. Leave empty and use Set up in the panel to create a private GitHub repo."
       },
       {
-        "key": "autoSync",
+        "key": "mode",
+        "type": "enum",
+        "label": "Automatic sync",
+        "options": [
+          "Manual",
+          "Push automatically",
+          "Push and pull automatically"
+        ],
+        "defaultValue": "Push automatically",
+        "description": "Push automatically shares this machine's changes but only applies other machines' changes when you click Pull. Push and pull automatically also applies them without asking."
+      },
+      {
+        "key": "onConflict",
+        "type": "enum",
+        "label": "When both machines changed",
+        "options": [
+          "Ask",
+          "Keep this machine",
+          "Use the repo"
+        ],
+        "defaultValue": "Ask",
+        "description": "Use the repo only applies automatically in Push and pull mode."
+      },
+      {
+        "key": "syncPlugins",
         "type": "boolean",
-        "label": "Sync automatically",
+        "label": "Sync installed plugins",
         "defaultValue": true,
-        "description": "Push or pull on its own when only one machine changed. When both changed, it waits for you."
+        "description": "Install plugins the other machine added, and sync which plugins are enabled."
+      },
+      {
+        "key": "removePlugins",
+        "type": "boolean",
+        "label": "Remove plugins removed elsewhere",
+        "defaultValue": true,
+        "description": "Plugins with uncommitted local changes are never removed."
+      },
+      {
+        "key": "syncBar",
+        "type": "boolean",
+        "label": "Sync bar layout",
+        "defaultValue": true,
+        "description": "Widget order, bar position, and widget settings."
+      },
+      {
+        "key": "syncShellSettings",
+        "type": "boolean",
+        "label": "Sync other shell settings",
+        "defaultValue": false,
+        "description": "Everything else in shell.json, such as idle and lock timers."
+      },
+      {
+        "key": "localOnly",
+        "type": "string",
+        "label": "Machine-specific plugins",
+        "defaultValue": "",
+        "description": "Comma-separated plugin ids that stay on this machine only: never installed, removed, or moved by a sync."
       },
       {
         "key": "intervalMinutes",
@@ -52,6 +111,12 @@
         "max": 240,
         "step": 5,
         "defaultValue": 15
+      },
+      {
+        "key": "notify",
+        "type": "boolean",
+        "label": "Notify after automatic pulls",
+        "defaultValue": true
       }
     ]
   }

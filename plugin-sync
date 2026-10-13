@@ -5,13 +5,26 @@
 #   plugin-sync status [--offline]   JSON summary for the bar widget
 #   plugin-sync push                 make the repo match this machine
 #   plugin-sync pull                 make this machine match the repo
-#   plugin-sync auto                 push or pull, whichever side changed
-#   plugin-sync init [owner/name]    create (or connect) the sync repo
+#   plugin-sync auto                 what the widget runs on its timer
+#   plugin-sync init [repo]          create (or connect) the sync repo
 #
 # The repo holds plugins.json (id + git URL of every git-managed plugin) and
-# shell.json (bar layout, widget settings, enabled plugins). The commit this
-# machine last synced at is the baseline that tells local and remote changes
-# apart.
+# shell.json. Each machine decides what it syncs through this widget's
+# settings in its own shell.json, which never leave the machine:
+#
+#   syncPlugins        installed plugins, and which non-bar plugins are enabled
+#   syncBar            bar layout, position, and widget settings
+#   syncShellSettings  everything else in shell.json (idle, lock, ...)
+#   localOnly          plugin ids that stay machine-specific
+#   removePlugins      let a pull remove plugins the repo no longer lists
+#   mode               Manual | Push automatically | Push and pull automatically
+#   onConflict         Ask | Keep this machine | Use the repo
+#   notify             desktop notifications for automatic syncs
+#
+# Pushing only replaces the parts this machine syncs, so machines that sync
+# different things share one repo without overwriting each other. The commit
+# this machine last synced at is the baseline that tells local and remote
+# changes apart.
 
 set -uo pipefail
 
@@ -31,18 +44,98 @@ mkdir -p "$STATE_DIR"
 
 die() { echo "plugin-sync: $*" >&2; exit 1; }
 
+# ---------------------------------------------------------------- settings
+
+shell_json() { if [[ -f $SHELL_JSON ]]; then jq . "$SHELL_JSON" 2>/dev/null || die "shell.json is not valid JSON"; else echo '{}'; fi; }
+
+# This widget's entry in the bar layout, or {}.
+widget_settings() {
+  shell_json | jq --arg id "$SELF_ID" '[.bar.layout // {} | .[] | arrays | .[] | select(.id == $id)] | first // {}'
+}
+
+load_settings() {
+  local s
+  s=$(widget_settings)
+  setting() { jq -r --arg k "$1" --arg d "$2" 'if has($k) and .[$k] != null then .[$k] | tostring else $d end' <<<"$s"; }
+  REPO_SETTING="${PLUGIN_SYNC_REPO:-$(setting repo "")}"
+  SYNC_PLUGINS=$(setting syncPlugins true)
+  SYNC_BAR=$(setting syncBar true)
+  SYNC_OTHER=$(setting syncShellSettings false)
+  REMOVE_PLUGINS=$(setting removePlugins true)
+  MODE=$(setting mode "Push automatically")
+  ON_CONFLICT=$(setting onConflict "Ask")
+  NOTIFY=$(setting notify true)
+  # Comma or space separated; this widget is always machine-specific.
+  LOCAL_ONLY=$(setting localOnly "" | tr ', ' '\n\n' | jq -Rn --arg self "$SELF_ID" '[inputs | select(length > 0)] + [$self] | unique')
+  CATS=$(jq -nc --argjson p "$SYNC_PLUGINS" --argjson b "$SYNC_BAR" --argjson o "$SYNC_OTHER" '{plugins: $p, bar: $b, other: $o}')
+}
+
 # "owner/name", an https URL, or an ssh URL → a clonable URL.
 repo_url() {
-  local repo="${PLUGIN_SYNC_REPO:-}"
+  local repo="$REPO_SETTING"
   [[ -z $repo && -f $URL_FILE ]] && repo=$(<"$URL_FILE")
   [[ -z $repo ]] && return 1
   [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && repo="https://github.com/$repo.git"
   printf '%s' "$repo"
 }
 
-notify() { command -v notify-send >/dev/null && notify-send -a "Plugin Sync" "$@" || true; }
+notify() {
+  [[ $NOTIFY == true ]] || return 0
+  command -v notify-send >/dev/null && notify-send -a "Plugin Sync" "$@" || true
+}
 
-# ---------------------------------------------------------------- snapshot
+# ---------------------------------------------------------------- shell.json parts
+
+# Shared jq definitions. $ids are machine-specific plugin ids, $c the synced
+# categories.
+JQ_DEFS='
+  def is_local($ids): (if type == "object" then .id else . end) as $i | $ids | index($i) != null;
+  def strip($ids): map(select(is_local($ids) | not));
+  def other_keys: keys - ["bar", "plugins", "disabledPlugins"];
+  def strip_layout($ids):
+    if (.layout | type) == "object"
+    then .layout |= (map_values(if type == "array" then strip($ids) else . end) | with_entries(select(.value != [])))
+    else . end;
+
+  # Only the synced parts, minus machine-specific plugins. Used for comparing.
+  def project($c; $ids):
+    . as $s
+    | (if $c.bar then {bar: (($s.bar // {}) | strip_layout($ids))} else {} end)
+    + (if $c.plugins then {plugins: (($s.plugins // []) | strip($ids)), disabledPlugins: (($s.disabledPlugins // []) | strip($ids))} else {} end)
+    + (if $c.other then ($s | with_entries(select(.key | IN("bar", "plugins", "disabledPlugins") | not))) else {} end);
+
+  # Put entries back at their old index, clamped to the new length.
+  def reinsert($old; $ids):
+    reduce ($old | to_entries[] | select(.value | is_local($ids))) as $e (.; .[0:$e.key] + [$e.value] + .[$e.key:]);
+
+  # Replace the synced parts of the base (.) with $in, keeping the base'"'"'s
+  # machine-specific entries where they were. Parts $in lacks stay as they are.
+  def merge($in; $c; $ids):
+    . as $base
+    | (if $c.bar and ($in | has("bar")) then
+        .bar = (($in.bar // {}) | strip_layout($ids))
+        | .bar.layout = (
+            (.bar.layout // {}) as $new
+            | (($base.bar.layout // {}) | keys) + ($new | keys) | unique
+            | map(. as $k | {key: $k, value: (($new[$k] // []) | reinsert(($base.bar.layout // {})[$k] // []; $ids))})
+            | from_entries
+            | with_entries(select(.value != []))
+          )
+      else . end)
+    | (if $c.plugins and ($in | has("plugins")) then
+        .plugins = ((($in.plugins // []) | strip($ids)) + (($base.plugins // []) | map(select(is_local($ids)))))
+        | .disabledPlugins = ((($in.disabledPlugins // []) | strip($ids)) + (($base.disabledPlugins // []) | map(select(is_local($ids)))))
+        | if .disabledPlugins == [] and ($base | has("disabledPlugins") | not) then del(.disabledPlugins) else . end
+      else . end)
+    | (if $c.other and ($in | other_keys | length > 0) then
+        reduce other_keys[] as $k (.; del(.[$k])) | . + ($in | with_entries(select(.key | IN("bar", "plugins", "disabledPlugins") | not)))
+      else . end);
+'
+
+# jq with the definitions above; the filter is the last argument.
+jqs() { jq --argjson c "$CATS" --argjson ids "$LOCAL_ONLY" "${@:1:$#-1}" "$JQ_DEFS ${!#}"; }
+
+# ---------------------------------------------------------------- plugins
 
 # Every git-managed plugin with an origin, as a sorted JSON array.
 local_plugins_json() {
@@ -70,22 +163,34 @@ unsyncable_json() {
   done | jq -s 'sort'
 }
 
-write_snapshot() {
-  local out="$1"
-  mkdir -p "$out"
-  local_plugins_json >"$out/plugins.json"
-  if [[ -f $SHELL_JSON ]]; then
-    jq -S . "$SHELL_JSON" >"$out/shell.json" || die "shell.json is not valid JSON"
+# ---------------------------------------------------------------- comparing
+
+# Canonical JSON of what this machine syncs, from a plugins list and a
+# shell.json. Equal fingerprints mean nothing to sync.
+fingerprint() {
+  local plugins="$1" shell="$2"
+  jqs -nS --argjson p "$plugins" --argjson s "$shell" '{
+    plugins: (if $c.plugins then ($p | map(select(is_local($ids) | not)) | map(.id) | sort) else null end),
+    shell: ($s | project($c; $ids))
+  }' | sha256sum | cut -d' ' -f1
+}
+
+# A JSON file from the repo at a commit, or the fallback if missing or broken.
+repo_file() {
+  local out
+  if out=$(git -C "$REPO_DIR" show "$1:$2" 2>/dev/null) && jq -e . >/dev/null 2>&1 <<<"$out"; then
+    printf '%s\n' "$out"
   else
-    echo '{}' >"$out/shell.json"
+    printf '%s\n' "$3"
   fi
 }
 
-# Hash of plugins.json + shell.json in a directory, or at a commit.
-dir_hash() { cat "$1/plugins.json" "$1/shell.json" 2>/dev/null | sha256sum | cut -d' ' -f1; }
-commit_hash() {
+# A shell.json worth writing: a non-empty JSON object.
+valid_shell() { jq -e 'type == "object" and length > 0' >/dev/null 2>&1 <<<"$1"; }
+
+commit_fingerprint() {
   [[ -n $1 ]] || { echo none; return; }
-  { git -C "$REPO_DIR" show "$1:plugins.json" 2>/dev/null; git -C "$REPO_DIR" show "$1:shell.json" 2>/dev/null; } | sha256sum | cut -d' ' -f1
+  fingerprint "$(repo_file "$1" plugins.json '[]')" "$(repo_file "$1" shell.json '{}')"
 }
 
 # ---------------------------------------------------------------- repo
@@ -98,32 +203,30 @@ ensure_repo() {
     git clone --quiet "$url" "$REPO_DIR" 2>/dev/null || die "cannot clone $url"
   elif [[ $(git -C "$REPO_DIR" remote get-url origin) != "$url" ]]; then
     git -C "$REPO_DIR" remote set-url origin "$url"
+    rm -f "$BASE_FILE"
   fi
   printf '%s' "$url" >"$URL_FILE"
 }
 
 fetch() { timeout 20 git -C "$REPO_DIR" fetch --quiet origin 2>/dev/null; }
 
-remote_head() {
-  local branch
-  branch=$(git -C "$REPO_DIR" symbolic-ref --short HEAD 2>/dev/null || echo main)
-  git -C "$REPO_DIR" rev-parse --verify --quiet "origin/$branch" 2>/dev/null || true
-}
+branch() { git -C "$REPO_DIR" symbolic-ref --short HEAD 2>/dev/null || echo main; }
+
+remote_head() { git -C "$REPO_DIR" rev-parse --verify --quiet "origin/$(branch)" 2>/dev/null || true; }
 
 base_commit() { [[ -f $BASE_FILE ]] && cat "$BASE_FILE" || true; }
 
 # local | remote | both | new | none — which side changed since the last
 # sync. "new" is a machine that has never synced with an existing repo.
 classify() {
-  local snap="$1" remote="$2" base="$3" local_h remote_h base_h
-  local_h=$(dir_hash "$snap")
-  remote_h=$(commit_hash "$remote")
-  if [[ -z $remote ]]; then echo local; return; fi
-  if [[ $local_h == "$remote_h" ]]; then echo none; return; fi
+  local local_fp="$1" remote="$2" base="$3" remote_fp base_fp
+  [[ -n $remote ]] || { echo local; return; }
+  remote_fp=$(commit_fingerprint "$remote")
+  [[ $local_fp == "$remote_fp" ]] && { echo none; return; }
   [[ -n $base ]] || { echo new; return; }
-  base_h=$(commit_hash "$base")
-  if [[ $remote_h == "$base_h" ]]; then echo local
-  elif [[ $local_h == "$base_h" ]]; then echo remote
+  base_fp=$(commit_fingerprint "$base")
+  if [[ $remote_fp == "$base_fp" ]]; then echo local
+  elif [[ $local_fp == "$base_fp" ]]; then echo remote
   else echo both
   fi
 }
@@ -131,48 +234,68 @@ classify() {
 # ---------------------------------------------------------------- commands
 
 cmd_status() {
-  local offline="${1:-}" url snap remote base state fetched=true
+  local offline="${1:-}" url remote state fetched=true have shell
+  load_settings
+  have=$(local_plugins_json)
+  local settings
+  settings=$(jq -n --argjson c "$CATS" --argjson ids "$LOCAL_ONLY" --arg mode "$MODE" --arg conflict "$ON_CONFLICT" \
+    --argjson remove "$REMOVE_PLUGINS" '$c + {localOnly: $ids, mode: $mode, onConflict: $conflict, removePlugins: $remove}')
+
   if ! url=$(repo_url); then
-    jq -n --argjson unsync "$(unsyncable_json)" --argjson plugins "$(local_plugins_json)" \
-      '{configured: false, state: "unconfigured", plugins: ($plugins | map(. + {status: "local"})), unsyncable: $unsync}'
+    jq -n --argjson unsync "$(unsyncable_json)" --argjson plugins "$have" --argjson settings "$settings" \
+      '{configured: false, state: "unconfigured", settings: $settings, plugins: ($plugins | map(. + {status: "local"})), unsyncable: $unsync}'
     return
   fi
-  ensure_repo 2>/dev/null || {
-    jq -n --arg url "$url" '{configured: true, repo: $url, state: "error", error: "Cannot reach the sync repo", plugins: [], unsyncable: []}'
+  if ! (ensure_repo) 2>/dev/null; then
+    jq -n --arg url "$url" --argjson settings "$settings" \
+      '{configured: true, repo: $url, state: "error", error: "Cannot reach the sync repo", settings: $settings, plugins: [], unsyncable: []}'
     return
-  }
+  fi
   if [[ $offline != --offline ]]; then fetch || fetched=false; fi
 
-  snap=$(mktemp -d); trap 'rm -rf "$snap"' RETURN
-  write_snapshot "$snap"
+  shell=$(shell_json)
   remote=$(remote_head)
-  base=$(base_commit)
-  state=$(classify "$snap" "$remote" "$base")
+  state=$(classify "$(fingerprint "$have" "$shell")" "$remote" "$(base_commit)")
 
-  local remote_plugins='[]' last_host="" last_time=""
+  local remote_plugins='[]' remote_shell='{}' last_host="" last_time=""
   if [[ -n $remote ]]; then
-    remote_plugins=$(git -C "$REPO_DIR" show "$remote:plugins.json" 2>/dev/null || echo '[]')
+    remote_plugins=$(repo_file "$remote" plugins.json '[]')
+    remote_shell=$(repo_file "$remote" shell.json '{}')
     last_host=$(git -C "$REPO_DIR" log -1 --format=%s "$remote" | sed -n 's/^sync from //p')
     last_time=$(git -C "$REPO_DIR" log -1 --format=%cI "$remote")
   fi
 
-  jq -n \
+  jqs -n \
     --arg url "$url" --arg state "$state" --arg host "$HOST" \
     --arg lastHost "$last_host" --arg lastTime "$last_time" \
-    --argjson fetched "$fetched" \
-    --argjson local "$(cat "$snap/plugins.json")" \
-    --argjson remote "$remote_plugins" \
-    --argjson unsync "$(unsyncable_json)" \
-    --argjson layoutChanged "$( [[ -z $remote ]] || ! diff -q <(git -C "$REPO_DIR" show "$remote:shell.json" 2>/dev/null) "$snap/shell.json" >/dev/null && echo true || echo false)" '
+    --argjson fetched "$fetched" --argjson hasRemote "$([[ -n $remote ]] && echo true || echo false)" \
+    --argjson local "$have" --argjson remote "$remote_plugins" \
+    --argjson shell "$shell" --argjson remoteShell "$remote_shell" \
+    --argjson unsync "$(unsyncable_json)" --argjson settings "$settings" '
     ($local | map(.id)) as $l | ($remote | map(.id)) as $r |
+    (($shell | project($c; $ids)) as $mine | ($remoteShell | project($c; $ids)) as $theirs | {
+      bar: ($c.bar and $hasRemote and $mine.bar != $theirs.bar),
+      plugins: ($c.plugins and $hasRemote and ($mine.plugins != $theirs.plugins or $mine.disabledPlugins != $theirs.disabledPlugins)),
+      other: ($c.other and $hasRemote and ($mine | del(.bar, .plugins, .disabledPlugins)) != ($theirs | del(.bar, .plugins, .disabledPlugins)))
+    }) as $differs |
     {
       configured: true, repo: $url, state: $state, host: $host, fetched: $fetched,
-      lastHost: $lastHost, lastTime: $lastTime, layoutChanged: $layoutChanged,
-      unsyncable: $unsync,
+      lastHost: $lastHost, lastTime: $lastTime, settings: $settings,
+      differs: $differs, unsyncable: $unsync,
       plugins: (
-        [ $local[] | . + {status: (if (.id | IN($r[])) then "synced" else "local" end)} ] +
-        [ $remote[] | select((.id | IN($l[])) | not) | . + {status: "remote"} ]
-        | sort_by(.id))
+        [ $local[] | . + {status: (
+            if is_local($ids) then "machine"
+            elif ($c.plugins | not) then "off"
+            elif (.id | IN($r[])) then "synced"
+            else "local" end)} ] +
+        [ $remote[] | select((.id | IN($l[])) | not) | select(is_local($ids) | not) | . + {status: (if $c.plugins then "remote" else "off" end)} ]
+        | sort_by(.id)),
+      # What a pull would do here.
+      pullPlan: {
+        install: (if $c.plugins then [$remote[] | select(is_local($ids) | not) | .id | select(IN($l[]) | not)] else [] end),
+        remove: (if $c.plugins and $settings.removePlugins then [$local[] | select(is_local($ids) | not) | .id | select(IN($r[]) | not)] else [] end),
+        bar: $differs.bar, pluginStates: $differs.plugins, other: $differs.other
+      }
     }'
 }
 
@@ -183,20 +306,34 @@ with_lock() {
 
 cmd_push() {
   with_lock
+  load_settings
   ensure_repo
   fetch || die "cannot fetch from the sync repo"
-  local branch remote
-  branch=$(git -C "$REPO_DIR" symbolic-ref --short HEAD 2>/dev/null || echo main)
+  local remote have shell
   remote=$(remote_head)
-  if [[ -n $remote ]]; then
-    git -C "$REPO_DIR" reset --quiet --hard "$remote"
+  [[ -n $remote ]] && git -C "$REPO_DIR" reset --quiet --hard "$remote"
+  have=$(local_plugins_json)
+  shell=$(shell_json)
+
+  # Replace only what this machine syncs; keep the rest of the repo as is.
+  local repo_plugins='[]' repo_shell='{}'
+  [[ -n $remote ]] && repo_plugins=$(repo_file HEAD plugins.json '[]') && repo_shell=$(repo_file HEAD shell.json '{}')
+  if [[ $SYNC_PLUGINS == true ]]; then
+    jqs -n --argjson repo "$repo_plugins" --argjson mine "$have" \
+      '($repo | map(select(is_local($ids)))) + ($mine | map(select(is_local($ids) | not))) | unique_by(.id)' >"$REPO_DIR/plugins.json"
+  else
+    printf '%s\n' "$repo_plugins" >"$REPO_DIR/plugins.json"
   fi
-  write_snapshot "$REPO_DIR"
+  local merged
+  merged=$(jqs -S --argjson mine "$shell" 'merge($mine; $c; $ids)' <<<"$repo_shell") && valid_shell "$merged" \
+    || die "could not merge shell.json; nothing was pushed"
+  printf '%s\n' "$merged" >"$REPO_DIR/shell.json"
+
   git -C "$REPO_DIR" add plugins.json shell.json
   if ! git -C "$REPO_DIR" diff --cached --quiet; then
-    git -C "$REPO_DIR" commit --quiet -m "sync from $HOST" || die "commit failed"
-    git -C "$REPO_DIR" push --quiet origin "HEAD:$branch" 2>/dev/null || die "push failed"
-    echo "Pushed this machine's plugins and layout"
+    git -C "$REPO_DIR" -c user.name="Plugin Sync" -c user.email="plugin-sync@$HOST" commit --quiet -m "sync from $HOST" || die "commit failed"
+    git -C "$REPO_DIR" push --quiet origin "HEAD:$(branch)" 2>/dev/null || die "push failed"
+    echo "Pushed this machine's changes"
   else
     echo "Repo already matches this machine"
   fi
@@ -205,6 +342,7 @@ cmd_push() {
 
 cmd_pull() {
   with_lock
+  load_settings
   ensure_repo
   fetch || die "cannot fetch from the sync repo"
   local remote
@@ -213,41 +351,49 @@ cmd_pull() {
   git -C "$REPO_DIR" reset --quiet --hard "$remote"
 
   local wanted have id url added=0 removed=0 skipped=()
-  wanted=$(cat "$REPO_DIR/plugins.json")
+  wanted=$(repo_file HEAD plugins.json '[]')
   have=$(local_plugins_json)
 
-  # Install plugins the repo has and this machine doesn't.
-  while IFS=$'\t' read -r id url; do
-    [[ -n $id ]] || continue
-    [[ -e $PLUGINS_DIR/$id ]] && continue
-    echo "Installing $id"
-    if omarchy plugin add "$url" --yes >>"$LOG_FILE" 2>&1; then
-      added=$((added + 1))
-    else
-      skipped+=("$id (install failed)")
-    fi
-  done < <(jq -r --argjson have "$have" '($have | map(.id)) as $h | .[] | select((.id | IN($h[])) | not) | [.id, .url] | @tsv' <<<"$wanted")
+  if [[ $SYNC_PLUGINS == true ]]; then
+    # Install plugins the repo has and this machine doesn't.
+    while IFS=$'\t' read -r id url; do
+      [[ -n $id && ! -e $PLUGINS_DIR/$id ]] || continue
+      echo "Installing $id"
+      if omarchy plugin add "$url" --yes >>"$LOG_FILE" 2>&1; then
+        added=$((added + 1))
+      else
+        skipped+=("$id (install failed)")
+      fi
+    done < <(jqs -r --argjson have "$have" '($have | map(.id)) as $h | .[] | select(is_local($ids) | not) | select((.id | IN($h[])) | not) | [.id, .url] | @tsv' <<<"$wanted")
 
-  # Remove git-managed plugins the repo dropped, unless they have local work.
-  while read -r id; do
-    [[ -n $id && $id != "$SELF_ID" ]] || continue
-    if [[ -n $(git -C "$PLUGINS_DIR/$id" status --porcelain 2>/dev/null) ]]; then
-      skipped+=("$id (has local changes, kept)")
-      continue
+    # Remove git-managed plugins the repo dropped, unless they have local work.
+    if [[ $REMOVE_PLUGINS == true ]]; then
+      while read -r id; do
+        [[ -n $id ]] || continue
+        if [[ -n $(git -C "$PLUGINS_DIR/$id" status --porcelain 2>/dev/null) ]]; then
+          skipped+=("$id (has local changes, kept)")
+          continue
+        fi
+        echo "Removing $id"
+        if omarchy plugin remove "$id" --yes >>"$LOG_FILE" 2>&1; then
+          removed=$((removed + 1))
+        else
+          skipped+=("$id (remove failed)")
+        fi
+      done < <(jqs -r --argjson wanted "$wanted" '($wanted | map(.id)) as $w | .[] | select(is_local($ids) | not) | .id | select(IN($w[]) | not)' <<<"$have")
     fi
-    echo "Removing $id"
-    if omarchy plugin remove "$id" --yes >>"$LOG_FILE" 2>&1; then
-      removed=$((removed + 1))
-    else
-      skipped+=("$id (remove failed)")
-    fi
-  done < <(jq -r --argjson wanted "$wanted" '($wanted | map(.id)) as $w | .[] | select((.id | IN($w[])) | not) | .id' <<<"$have")
+  fi
 
-  # Layout last, so every widget it names is installed.
-  if [[ -f $REPO_DIR/shell.json ]] && ! diff -q <(jq -S . "$SHELL_JSON" 2>/dev/null) "$REPO_DIR/shell.json" >/dev/null; then
+  # shell.json last, so every widget it names is installed. Read it again:
+  # removing a plugin also drops it from the bar.
+  local current merged
+  current=$(shell_json)
+  merged=$(jqs --argjson theirs "$(repo_file HEAD shell.json '{}')" 'merge($theirs; $c; $ids)' <<<"$current") && valid_shell "$merged" \
+    || die "could not merge the synced shell.json; this machine's shell.json was left unchanged"
+  if [[ $(jq -S . <<<"$current") != $(jq -S . <<<"$merged") ]]; then
     [[ -f $SHELL_JSON ]] && cp "$SHELL_JSON" "$SHELL_JSON.bak.$(date +%s)"
-    jq . "$REPO_DIR/shell.json" >"$SHELL_JSON.tmp" && mv "$SHELL_JSON.tmp" "$SHELL_JSON"
-    echo "Applied the synced bar layout"
+    printf '%s\n' "$merged" >"$SHELL_JSON.tmp" && mv "$SHELL_JSON.tmp" "$SHELL_JSON"
+    echo "Applied synced shell settings (backup saved next to shell.json)"
   fi
 
   omarchy-shell shell rescanPlugins >/dev/null 2>&1 || true
@@ -261,48 +407,65 @@ cmd_pull() {
   ((${#skipped[@]} == 0))
 }
 
-# Background mode for the widget: sync whichever side changed, never guess
-# when both did.
+# What the widget runs on its timer. Never changes this machine's config
+# unless the mode or conflict setting says so.
 cmd_auto() {
-  local remote state
+  local remote state out action=""
+  load_settings
+  [[ $MODE == Manual ]] && { echo "Manual mode"; return; }
   ensure_repo
   fetch || exit 0
-  AUTO_SNAP=$(mktemp -d); trap 'rm -rf "$AUTO_SNAP"' EXIT
-  write_snapshot "$AUTO_SNAP"
   remote=$(remote_head)
-  state=$(classify "$AUTO_SNAP" "$remote" "$(base_commit)")
+  state=$(classify "$(fingerprint "$(local_plugins_json)" "$(shell_json)")" "$remote" "$(base_commit)")
   case $state in
-    local) cmd_push ;;
-    remote)
+    local) action=push ;;
+    remote) [[ $MODE == "Push and pull automatically" ]] && action=pull ;;
+    both)
+      case $ON_CONFLICT in
+        "Keep this machine") action=push ;;
+        "Use the repo") [[ $MODE == "Push and pull automatically" ]] && action=pull ;;
+      esac ;;
+  esac
+
+  case $action in
+    push) cmd_push ;;
+    pull)
       if out=$(cmd_pull 2>&1); then notify "Plugins synced" "$out"
-      else notify -u critical "Plugin sync needs attention" "$out"; fi ;;
-    both) echo "Both machines changed; choose push or pull" ;;
-    new) echo "First sync on this machine; choose push or pull" ;;
-    *) echo "In sync" ;;
+      else notify -u critical "Plugin sync needs attention" "$out"; fi
+      echo "$out" ;;
+    *)
+      case $state in
+        remote) echo "Changes from another machine are ready to pull" ;;
+        both) echo "Both machines changed; choose push or pull" ;;
+        new) echo "First sync on this machine; choose push or pull" ;;
+        *) echo "In sync" ;;
+      esac ;;
   esac
 }
 
 cmd_init() {
   local repo="${1:-}"
+  load_settings
+  [[ -n $repo ]] || repo="$REPO_SETTING"
   if [[ -z $repo ]]; then
     local owner
-    owner=$(gh api user --jq .login 2>/dev/null) || die "log in with: gh auth login"
+    owner=$(gh api user --jq .login 2>/dev/null) || die "set the widget's Sync repo setting, or log in with: gh auth login"
     repo="$owner/omarchy-sync"
   fi
-  if [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && ! gh repo view "$repo" >/dev/null 2>&1; then
-    echo "Creating private repo $repo"
+  if [[ $repo =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] && command -v gh >/dev/null && ! gh repo view "$repo" >/dev/null 2>&1; then
+    read -r -p "Create a private GitHub repo $repo? [y/N] " answer
+    [[ $answer == [yY]* ]] || die "cancelled"
     gh repo create "$repo" --private --description "Omarchy plugins and bar layout, synced by Plugin Sync" >/dev/null || die "could not create $repo"
   fi
-  PLUGIN_SYNC_REPO="$repo"
-  export PLUGIN_SYNC_REPO
-  rm -rf "$REPO_DIR"
+  REPO_SETTING="$repo"
+  rm -rf "$REPO_DIR" "$BASE_FILE"
   ensure_repo
-  # Put the repo name in the widget settings so it rides along with the layout.
-  if jq -e --arg id "$SELF_ID" '[.bar.layout[][] | select(.id == $id)] | length > 0' "$SHELL_JSON" >/dev/null 2>&1; then
+  # Remember the repo in the widget settings on this machine.
+  if [[ $(widget_settings) != "{}" ]]; then
     omarchy bar set "$SELF_ID" repo "$repo" >/dev/null 2>&1 || true
   fi
   if [[ -n $(remote_head) ]]; then
-    echo "Connected to $repo, which already has a sync. Pull to apply it here."
+    echo "Connected to $repo, which already has a sync. Open the panel and pull to apply it here."
   else
     git -C "$REPO_DIR" checkout --quiet -B main
     cmd_push
@@ -315,5 +478,5 @@ case "${1:-status}" in
   pull) cmd_pull ;;
   auto) cmd_auto ;;
   init) cmd_init "${2:-}" ;;
-  *) die "usage: plugin-sync status|push|pull|auto|init [owner/name]" ;;
+  *) die "usage: plugin-sync status|push|pull|auto|init [repo]" ;;
 esac

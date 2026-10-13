@@ -6,6 +6,11 @@ import qs.Ui
 
 // Sync panel: owns the sync state, runs the plugin-sync helper, and keeps
 // the bar icon (BarWidget.qml) informed through syncState/busy/headline.
+//
+// Three views share the panel: the sync overview, a confirmation that lists
+// exactly what a push or pull will change, and this machine's settings. The
+// helper reads the same settings from shell.json, so the panel only writes
+// them and never passes them along.
 Panel {
   id: root
   moduleName: "io.github.jacueblol.plugin-sync"
@@ -21,14 +26,17 @@ Panel {
   readonly property color urgentColor: bar ? bar.urgent : Color.urgent
 
   readonly property string helper: String(Qt.resolvedUrl("plugin-sync")).replace(/^file:\/\//, "")
-  readonly property string repo: String(setting("repo", ""))
-  readonly property bool autoSync: setting("autoSync", true) === true
+
+  // ---- Settings (defaults match manifest.json and the helper).
+  readonly property string mode: String(setting("mode", "Push automatically"))
   readonly property int intervalMinutes: Math.max(5, Number(setting("intervalMinutes", 15)) || 15)
-  readonly property var helperArgv: repo ? ["env", "PLUGIN_SYNC_REPO=" + repo, helper] : [helper]
+  readonly property var localOnly: String(setting("localOnly", "")).split(/[\s,]+/).filter(function(s) { return s !== "" })
 
   property var status: ({ configured: false, state: "loading", plugins: [], unsyncable: [] })
   property string busy: ""          // "push" | "pull" | "auto" while running
   property string message: ""
+  property string view: "main"      // "main" | "confirm" | "settings"
+  property string confirmAction: "" // "push" | "pull"
 
   readonly property string syncState: status.state || "loading"
   readonly property bool needsAttention: ["local", "remote", "both", "new", "error"].indexOf(syncState) !== -1
@@ -37,7 +45,7 @@ Panel {
     unconfigured: "Not set up yet",
     none: "In sync",
     local: "This machine has changes to push",
-    remote: "The other machine has changes to pull",
+    remote: "Another machine has changes to pull",
     both: "Both machines changed. Pick which one wins",
     new: "First sync here. Pull to adopt the shared setup",
     error: status.error || "Sync error"
@@ -46,8 +54,28 @@ Panel {
   readonly property var pluginStatusText: ({
     synced: "synced",
     local: "only here",
-    remote: "only in sync"
+    remote: "to install",
+    machine: "this machine only",
+    off: "not synced"
   })
+  readonly property var plan: status.pullPlan || ({ install: [], remove: [], bar: false, pluginStates: false, other: false })
+  readonly property var planLines: {
+    var lines = []
+    if (plan.install.length) lines.push("Install " + plan.install.join(", "))
+    if (plan.remove.length) lines.push("Remove " + plan.remove.join(", "))
+    if (plan.bar) lines.push("Replace the bar layout and widget settings")
+    if (plan.pluginStates) lines.push("Update which plugins are enabled")
+    if (plan.other) lines.push("Replace other shell settings (idle, lock, …)")
+    return lines
+  }
+  readonly property string syncedSummary: {
+    var s = status.settings || {}
+    var parts = []
+    if (s.plugins !== false) parts.push("plugins")
+    if (s.bar !== false) parts.push("bar")
+    if (s.other === true) parts.push("shell settings")
+    return (parts.length ? "Syncs " + parts.join(", ") : "Syncs nothing") + " · " + mode
+  }
 
   function switchPanel(direction) {
     if (bar && typeof bar.switchPanelFrom === "function") return bar.switchPanelFrom(barIdentity, direction)
@@ -56,7 +84,7 @@ Panel {
 
   function refresh(offline) {
     if (statusProc.running || busy) return
-    statusProc.command = helperArgv.concat(offline ? ["status", "--offline"] : ["status"])
+    statusProc.command = [helper].concat(offline ? ["status", "--offline"] : ["status"])
     statusProc.running = true
   }
 
@@ -64,15 +92,46 @@ Panel {
     if (busy) return
     busy = action
     message = ""
-    actionProc.command = helperArgv.concat([action])
+    view = "main"
+    actionProc.command = [helper, action]
     actionProc.running = true
+  }
+
+  // Pushing over another machine's changes, or pulling over this machine's
+  // config, is confirmed first with the exact list of what changes.
+  function request(action) {
+    var overwritesOther = action === "push" && ["remote", "both", "new"].indexOf(syncState) !== -1
+    var changesHere = action === "pull" && planLines.length > 0
+    if (overwritesOther || changesHere) {
+      confirmAction = action
+      view = "confirm"
+    } else {
+      runAction(action)
+    }
+  }
+
+  function saveSetting(key, value) {
+    var entry = { id: moduleName }
+    for (var k in settings) if (k !== "id") entry[k] = settings[k]
+    entry[key] = value
+    settings = entry
+    if (bar && bar.shell && typeof bar.shell.updateEntryInline === "function")
+      bar.shell.updateEntryInline(moduleName, entry)
+    settingsSaved.restart()
+  }
+
+  function toggleLocalOnly(id) {
+    var ids = localOnly.slice()
+    var i = ids.indexOf(id)
+    if (i === -1) ids.push(id)
+    else ids.splice(i, 1)
+    saveSetting("localOnly", ids.join(","))
   }
 
   // init may need to create a repo or log in, so it gets a terminal.
   function setUp() {
     root.close()
-    Util.execArgv(["omarchy-launch-floating-terminal-with-presentation",
-      helperArgv.map(Util.shellQuote).join(" ") + " init"])
+    Util.execArgv(["omarchy-launch-floating-terminal-with-presentation", Util.shellQuote(helper) + " init"])
   }
 
   function openOmaplug() {
@@ -89,8 +148,10 @@ Panel {
     return Math.round(mins / 1440) + " d ago"
   }
 
-  onOpenedChanged: if (opened) refresh(false)
-  onRepoChanged: refresh(false)
+  onOpenedChanged: {
+    if (opened) refresh(false)
+    else view = "main"
+  }
   Component.onCompleted: refresh(true)
 
   Process {
@@ -103,9 +164,9 @@ Panel {
         } catch (e) {
           root.status = { configured: true, state: "error", error: "Could not read sync status", plugins: [], unsyncable: [] }
         }
-        // Plugins installed or removed through Omaplug (or a layout change)
-        // show up here as local changes; push them right away.
-        if (root.autoSync && root.syncState === "local") root.runAction("push")
+        // Plugins installed or removed through Omaplug (or a bar change)
+        // show up here as local changes. Pushing only touches the repo.
+        if (root.mode !== "Manual" && root.syncState === "local") root.runAction("push")
       }
     }
   }
@@ -122,6 +183,13 @@ Panel {
     }
   }
 
+  // shell.json is written by the shell; read the new settings back after it.
+  Timer {
+    id: settingsSaved
+    interval: 600
+    onTriggered: root.refresh(true)
+  }
+
   // Cheap local check, so Omaplug installs and bar edits are noticed quickly.
   Timer {
     interval: 60 * 1000
@@ -130,13 +198,14 @@ Panel {
     onTriggered: root.refresh(true)
   }
 
-  // Full check against the remote.
+  // Full check against the remote. The helper decides from the mode setting
+  // whether to push, pull, or only report.
   Timer {
     interval: root.intervalMinutes * 60 * 1000
     running: root.status.configured === true
     repeat: true
     triggeredOnStart: true
-    onTriggered: root.autoSync ? root.runAction("auto") : root.refresh(false)
+    onTriggered: root.runAction("auto")
   }
 
   KeyboardPanel {
@@ -146,18 +215,20 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(440))
+    contentWidth: panel.fittedContentWidth(Style.space(460))
     contentHeight: panel.fittedContentHeight(column.implicitHeight)
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onCloseRequested: root.close()
+      onCloseRequested: root.view !== "main" ? root.view = "main" : root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
-        if (t === "p") root.runAction("push")
-        else if (t === "l") root.runAction("pull")
+        if (root.view !== "main") return
+        if (t === "p") root.request("push")
+        else if (t === "l") root.request("pull")
         else if (t === "m") root.openOmaplug()
+        else if (t === "s") root.view = "settings"
       }
 
       Column {
@@ -168,126 +239,143 @@ Panel {
         spacing: Style.space(12)
 
         // ---------- Header ----------
-        Column {
+        Item {
           width: parent.width
-          spacing: Style.space(4)
+          implicitHeight: header.implicitHeight
 
-          Text {
-            text: "Plugin Sync"
-            color: root.foreground
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.title
-            font.bold: true
+          Column {
+            id: header
+            anchors.left: parent.left
+            anchors.right: settingsButton.left
+            anchors.rightMargin: Style.space(8)
+            spacing: Style.space(4)
+
+            Text {
+              text: root.view === "settings" ? "Plugin Sync · Settings" : "Plugin Sync"
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.title
+              font.bold: true
+            }
+
+            Text {
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.headline.toUpperCase()
+              color: root.syncState === "both" || root.syncState === "error" ? root.urgentColor : Color.accent
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              font.bold: true
+              font.letterSpacing: 1.2
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              visible: root.status.configured === true
+              width: parent.width
+              textFormat: Text.PlainText
+              text: String(root.status.repo || "").replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "")
+                + (root.status.lastHost ? " · last sync from " + root.status.lastHost + " " + root.relativeTime(root.status.lastTime) : "")
+              color: root.foreground
+              opacity: 0.6
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              elide: Text.ElideRight
+            }
+
+            Text {
+              visible: root.message !== "" && root.message.toLowerCase() !== root.headline.toLowerCase()
+              width: parent.width
+              textFormat: Text.PlainText
+              text: root.message
+              color: root.foreground
+              opacity: 0.8
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+              wrapMode: Text.WordWrap
+            }
           }
 
-          Text {
-            width: parent.width
-            textFormat: Text.PlainText
-            text: root.headline.toUpperCase()
-            color: root.syncState === "both" || root.syncState === "error" ? root.urgentColor : Color.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
-            font.bold: true
-            font.letterSpacing: 1.2
-            wrapMode: Text.WordWrap
-          }
-
-          Text {
-            visible: root.status.configured === true
-            width: parent.width
-            textFormat: Text.PlainText
-            text: String(root.status.repo || "").replace(/^https:\/\/github\.com\//, "").replace(/\.git$/, "")
-              + (root.status.lastHost ? " · last sync from " + root.status.lastHost + " " + root.relativeTime(root.status.lastTime) : "")
-            color: root.foreground
-            opacity: 0.6
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            elide: Text.ElideRight
-          }
-
-          Text {
-            visible: root.message !== ""
-            width: parent.width
-            textFormat: Text.PlainText
-            text: root.message
-            color: root.foreground
-            opacity: 0.8
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.bodySmall
-            wrapMode: Text.WordWrap
+          PanelActionButton {
+            id: settingsButton
+            anchors.right: parent.right
+            anchors.top: parent.top
+            iconText: root.view === "settings" ? "󰅖" : "󰒓"
+            tooltipText: root.view === "settings" ? "Back" : "Settings (s)"
+            foreground: root.foreground
+            onClicked: root.view = root.view === "settings" ? "main" : "settings"
           }
         }
 
-        // ---------- Actions ----------
-        Row {
-          spacing: Style.space(8)
-
-          Button {
-            visible: root.status.configured !== true
-            iconText: "󰊢"
-            iconSize: Style.font.title
-            text: "Set up sync repo"
-            tooltipText: "Create or connect a private GitHub repo"
-            fontSize: Style.font.bodySmall
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            onClicked: root.setUp()
-          }
-
-          Button {
-            visible: root.status.configured === true
-            enabled: root.busy === ""
-            iconText: "󰕒"
-            iconSize: Style.font.title
-            text: "Push"
-            tooltipText: "Make the sync repo match this machine (p)"
-            fontSize: Style.font.bodySmall
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            active: root.syncState === "local"
-            onClicked: root.runAction("push")
-          }
-
-          Button {
-            visible: root.status.configured === true
-            enabled: root.busy === ""
-            iconText: "󰇚"
-            iconSize: Style.font.title
-            text: "Pull"
-            tooltipText: "Make this machine match the sync repo (l)"
-            fontSize: Style.font.bodySmall
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            active: root.syncState === "remote" || root.syncState === "new"
-            onClicked: root.runAction("pull")
-          }
-
-          Button {
-            iconText: "󱓖"
-            iconSize: Style.font.title
-            text: "Omaplug"
-            tooltipText: "Install, update, and arrange plugins in Omaplug (m)"
-            fontSize: Style.font.bodySmall
-            foreground: root.foreground
-            fontFamily: root.fontFamily
-            bordered: true
-            onClicked: root.openOmaplug()
-          }
-        }
-
-        PanelSeparator { foreground: root.foreground }
-
-        // ---------- Plugins ----------
+        // ================= Main view =================
         Column {
+          visible: root.view === "main"
           width: parent.width
-          spacing: Style.space(6)
+          spacing: Style.space(12)
+
+          Row {
+            spacing: Style.space(8)
+
+            Button {
+              visible: root.status.configured !== true
+              iconText: "󰊢"
+              iconSize: Style.font.title
+              text: "Set up sync repo"
+              tooltipText: "Create or connect the git repo that holds your sync"
+              fontSize: Style.font.bodySmall
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.setUp()
+            }
+
+            Button {
+              visible: root.status.configured === true
+              enabled: root.busy === ""
+              iconText: "󰕒"
+              iconSize: Style.font.title
+              text: "Push"
+              tooltipText: "Share this machine's plugins and settings (p)"
+              fontSize: Style.font.bodySmall
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              active: root.syncState === "local"
+              onClicked: root.request("push")
+            }
+
+            Button {
+              visible: root.status.configured === true
+              enabled: root.busy === ""
+              iconText: "󰇚"
+              iconSize: Style.font.title
+              text: "Pull"
+              tooltipText: "Apply changes from your other machines (l)"
+              fontSize: Style.font.bodySmall
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              active: root.syncState === "remote" || root.syncState === "new"
+              onClicked: root.request("pull")
+            }
+
+            Button {
+              iconText: "󱓖"
+              iconSize: Style.font.title
+              text: "Omaplug"
+              tooltipText: "Install, update, and arrange plugins in Omaplug (m)"
+              fontSize: Style.font.bodySmall
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.openOmaplug()
+            }
+          }
+
+          PanelSeparator { foreground: root.foreground }
 
           Text {
-            text: (root.status.plugins || []).length + " plugins"
-              + (root.status.layoutChanged ? " · bar layout differs" : "")
+            text: root.syncedSummary
             color: root.foreground
             opacity: 0.6
             font.family: root.fontFamily
@@ -325,8 +413,8 @@ Panel {
                 anchors.verticalCenter: parent.verticalCenter
                 textFormat: Text.PlainText
                 text: root.pluginStatusText[modelData.status] || modelData.status
-                color: modelData.status === "synced" ? root.foreground : Color.accent
-                opacity: modelData.status === "synced" ? 0.45 : 1
+                color: modelData.status === "local" || modelData.status === "remote" ? Color.accent : root.foreground
+                opacity: modelData.status === "local" || modelData.status === "remote" ? 1 : 0.45
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
@@ -344,17 +432,265 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
+
+          Text {
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            textFormat: Text.PlainText
+            text: "p push  ·  l pull  ·  m Omaplug  ·  s settings"
+            color: root.foreground
+            opacity: 0.45
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
         }
 
-        Text {
+        // ================= Confirm view =================
+        Column {
+          visible: root.view === "confirm"
           width: parent.width
-          horizontalAlignment: Text.AlignHCenter
-          textFormat: Text.PlainText
-          text: "p push  ·  l pull  ·  m open Omaplug" + (root.autoSync ? "  ·  auto-sync on" : "")
-          color: root.foreground
-          opacity: 0.45
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
+          spacing: Style.space(10)
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.confirmAction === "pull"
+              ? "Pulling will change this machine:"
+              : "Pushing will replace what your other machines shared, for the parts this machine syncs."
+            color: root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: true
+          }
+
+          Repeater {
+            model: root.confirmAction === "pull" ? root.planLines : []
+
+            Text {
+              required property string modelData
+              width: parent.width
+              wrapMode: Text.WordWrap
+              textFormat: Text.PlainText
+              text: "•  " + modelData
+              color: root.foreground
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
+            text: root.confirmAction === "pull"
+              ? (root.syncState === "both" ? "This machine's unsynced changes to those parts will be lost. " : "")
+                + "shell.json is backed up first. Machine-specific plugins are never touched."
+              : "Their changes stay in the repo's history."
+            color: root.foreground
+            opacity: 0.6
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Row {
+            spacing: Style.space(8)
+
+            Button {
+              iconText: root.confirmAction === "pull" ? "󰇚" : "󰕒"
+              iconSize: Style.font.title
+              text: root.confirmAction === "pull" ? "Pull now" : "Push now"
+              fontSize: Style.font.bodySmall
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              active: true
+              onClicked: root.runAction(root.confirmAction)
+            }
+
+            Button {
+              text: "Cancel"
+              fontSize: Style.font.bodySmall
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              bordered: true
+              onClicked: root.view = "main"
+            }
+          }
+        }
+
+        // ================= Settings view =================
+        Flickable {
+          visible: root.view === "settings"
+          width: parent.width
+          height: Math.min(settingsColumn.implicitHeight, Style.space(560))
+          contentHeight: settingsColumn.implicitHeight
+          clip: true
+          boundsBehavior: Flickable.StopAtBounds
+
+        Column {
+          id: settingsColumn
+          width: parent.width
+          spacing: Style.space(10)
+
+          PanelSectionHeader { text: "What this machine syncs"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+          Repeater {
+            model: [
+              { key: "syncPlugins", label: "Installed plugins", hint: "Install plugins added elsewhere; sync which are enabled", fallback: true },
+              { key: "removePlugins", label: "Remove plugins removed elsewhere", hint: "Never removes plugins with local changes", fallback: true },
+              { key: "syncBar", label: "Bar layout", hint: "Widget order, bar position, widget settings", fallback: true },
+              { key: "syncShellSettings", label: "Other shell settings", hint: "Idle, lock, and the rest of shell.json", fallback: false },
+              { key: "notify", label: "Notify after automatic pulls", hint: "", fallback: true }
+            ]
+
+            Item {
+              id: toggleRow
+              required property var modelData
+              readonly property bool checked: root.setting(modelData.key, modelData.fallback) === true
+              width: parent.width
+              implicitHeight: Math.max(labels.implicitHeight, toggle.implicitHeight)
+
+              Column {
+                id: labels
+                anchors.left: parent.left
+                anchors.right: toggle.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+
+                Text {
+                  width: parent.width
+                  text: toggleRow.modelData.label
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  elide: Text.ElideRight
+                }
+
+                Text {
+                  visible: toggleRow.modelData.hint !== ""
+                  width: parent.width
+                  text: toggleRow.modelData.hint
+                  color: root.foreground
+                  opacity: 0.5
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  elide: Text.ElideRight
+                }
+              }
+
+              ToggleSwitch {
+                id: toggle
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                checked: toggleRow.checked
+                foreground: root.foreground
+                onToggled: root.saveSetting(toggleRow.modelData.key, !toggleRow.checked)
+              }
+            }
+          }
+
+          PanelSectionHeader { text: "When to sync"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+          Dropdown {
+            width: parent.width
+            label: "Automatic sync"
+            value: root.mode
+            options: ["Manual", "Push automatically", "Push and pull automatically"]
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onChanged: function(v) { root.saveSetting("mode", v) }
+          }
+
+          Dropdown {
+            width: parent.width
+            label: "When both machines changed"
+            value: String(root.setting("onConflict", "Ask"))
+            options: ["Ask", "Keep this machine", "Use the repo"]
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onChanged: function(v) { root.saveSetting("onConflict", v) }
+          }
+
+          NumberField {
+            width: parent.width
+            label: "Check other machines every (minutes)"
+            value: root.intervalMinutes
+            from: 5
+            to: 240
+            stepSize: 5
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onModified: function(v) { root.saveSetting("intervalMinutes", v) }
+          }
+
+          PanelSectionHeader { text: "Machine-specific plugins"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "Switched on plugins stay on this machine only: never installed, removed, or moved by a sync."
+            color: root.foreground
+            opacity: 0.5
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+
+          Repeater {
+            model: (root.status.plugins || []).filter(function(p) { return p.id !== root.moduleName && p.status !== "remote" })
+
+            Item {
+              id: localRow
+              required property var modelData
+              width: parent.width
+              implicitHeight: localToggle.implicitHeight
+
+              Text {
+                anchors.left: parent.left
+                anchors.right: localToggle.left
+                anchors.rightMargin: Style.space(10)
+                anchors.verticalCenter: parent.verticalCenter
+                text: localRow.modelData.id
+                color: root.foreground
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.body
+                elide: Text.ElideRight
+              }
+
+              ToggleSwitch {
+                id: localToggle
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                checked: root.localOnly.indexOf(localRow.modelData.id) !== -1
+                foreground: root.foreground
+                onToggled: root.toggleLocalOnly(localRow.modelData.id)
+              }
+            }
+          }
+
+          PanelSectionHeader { text: "Sync repo"; foreground: root.foreground; fontFamily: root.fontFamily }
+
+          TextField {
+            width: parent.width
+            text: String(root.setting("repo", ""))
+            placeholderText: "owner/name or git URL"
+            foreground: root.foreground
+            accent: Color.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            onEditingFinished: if (text.trim() !== String(root.setting("repo", ""))) root.saveSetting("repo", text.trim())
+          }
+
+          Text {
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: "These settings apply to this machine only and are never synced."
+            color: root.foreground
+            opacity: 0.5
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
         }
       }
     }
